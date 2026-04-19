@@ -1,4 +1,9 @@
-"""Gemini AI service: text parsing + voice transcription."""
+"""Gemini AI service: text parsing + voice transcription.
+
+UPDATED: Now supports parsing MULTIPLE intents from a single message.
+E.g. "Yugurdim 30 min. Kitob 1 soat o'qidim. Dush qabul qildim."
+    → returns 3 separate intents
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,8 +12,8 @@ import os
 import re
 import tempfile
 import traceback
-from dataclasses import asdict, dataclass
-from typing import Optional
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional
 
 import google.generativeai as genai
 from pydub import AudioSegment
@@ -21,8 +26,14 @@ genai.configure(api_key=config.gemini_api_key)
 
 MODEL_NAME = "gemini-2.0-flash"
 
-PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assistantsan. Foydalanuvchi kundalik odat yoki xarajatini yozadi. Matnni tahlil qilib FAQAT quyidagi JSON formatda qaytar, boshqa hech narsa yozma:
+PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assistantsan.
 
+Foydalanuvchi BITTA xabarda BIR YOKI BIR NECHTA odat/xarajat/kirim yozishi mumkin.
+Matnni tahlil qilib HAR BIR harakatni alohida JSON obyekti sifatida qaytar.
+
+MUHIM: Natijani har DOIM JSON array (massiv) sifatida qaytar, hatto bitta narsa bo'lsa ham.
+
+Har bir obyekt quyidagi formatda:
 {{
   "type": "HABIT_LOG | BUDGET_EXPENSE | BUDGET_INCOME | UNKNOWN",
   "habit_name": "string yoki null",
@@ -37,22 +48,50 @@ PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assi
 }}
 
 Misollar:
-- "bugun 30 daqiqa yugurdim" → HABIT_LOG, habit_name: "Yugurish", duration: 30, duration_unit: "min"
-- "nonvoydan 15000 so'm non oldim" → BUDGET_EXPENSE, category: "oziq-ovqat", amount: 15000, currency: "UZS"
-- "oylik maosh 3000000 so'm" → BUDGET_INCOME, amount: 3000000, currency: "UZS"
-- "taksiga 25 ming to'ladim" → BUDGET_EXPENSE, category: "transport", amount: 25000, currency: "UZS"
-- "kitob 2 soat o'qidim" → HABIT_LOG, habit_name: "Kitob o'qish", duration: 2, duration_unit: "hour"
-- "salom" → UNKNOWN, confidence: 0.0
+
+Matn: "bugun 30 daqiqa yugurdim"
+Javob: [{{"type": "HABIT_LOG", "habit_name": "Yugurish", "duration": 30, "duration_unit": "min", "date": "today", "confidence": 0.95}}]
+
+Matn: "nonvoydan 15000 so'm non oldim"
+Javob: [{{"type": "BUDGET_EXPENSE", "category": "oziq-ovqat", "amount": 15000, "currency": "UZS", "date": "today", "confidence": 0.95}}]
+
+Matn: "taksiga 25 ming to'ladim"
+Javob: [{{"type": "BUDGET_EXPENSE", "category": "transport", "amount": 25000, "currency": "UZS", "date": "today", "confidence": 0.95}}]
+
+Matn: "BUGUN 4 SOAT YUGURDIM. 10 DAQIQA KITOB O'QIDIM. Dush qabul qildim"
+Javob: [
+  {{"type": "HABIT_LOG", "habit_name": "Yugurish", "duration": 4, "duration_unit": "hour", "date": "today", "confidence": 0.95}},
+  {{"type": "HABIT_LOG", "habit_name": "Kitob o'qish", "duration": 10, "duration_unit": "min", "date": "today", "confidence": 0.95}},
+  {{"type": "HABIT_LOG", "habit_name": "Dush qabul qilish", "date": "today", "confidence": 0.9}}
+]
+
+Matn: "nonga 15 ming, taksiga 25 ming ketdi"
+Javob: [
+  {{"type": "BUDGET_EXPENSE", "category": "oziq-ovqat", "amount": 15000, "currency": "UZS", "date": "today", "confidence": 0.9}},
+  {{"type": "BUDGET_EXPENSE", "category": "transport", "amount": 25000, "currency": "UZS", "date": "today", "confidence": 0.95}}
+]
+
+Matn: "salom"
+Javob: [{{"type": "UNKNOWN", "confidence": 0.0}}]
 
 Matn: {user_message}
+
+ESLATMA: Har doim JSON array qaytar, boshqa hech narsa yozma.
 """
 
 
 @dataclass
 class AIResult:
-    intent: ParsedIntent
+    intents: List[ParsedIntent] = field(default_factory=list)
     transcribed_text: Optional[str] = None
     used_ai: bool = False
+
+    @property
+    def intent(self) -> ParsedIntent:
+        """Backward compatibility: return first intent."""
+        if self.intents:
+            return self.intents[0]
+        return ParsedIntent(type="UNKNOWN", confidence=0.0)
 
 
 class AIServiceError(Exception):
@@ -62,11 +101,10 @@ class AIServiceError(Exception):
 class AIService:
     def __init__(self) -> None:
         self.model = genai.GenerativeModel(MODEL_NAME)
-        self._sem = asyncio.Semaphore(10)  # Concurrent API calls
+        self._sem = asyncio.Semaphore(10)
 
     # ─── VOICE ──────────────────────────────────────────────
     async def transcribe_voice(self, ogg_path: str) -> str:
-        """Convert .ogg → .mp3, send to Gemini, return transcription."""
         mp3_path = ogg_path.replace(".ogg", ".mp3")
         try:
             await asyncio.get_running_loop().run_in_executor(
@@ -113,23 +151,25 @@ class AIService:
 
     # ─── TEXT PARSING ───────────────────────────────────────
     async def parse_intent(self, text: str) -> AIResult:
-        """Parse user text into structured intent. Uses fast parser first."""
-        # 1. Try fast parser
+        """Parse user text into structured intent(s).
+        
+        For backward compatibility, returns AIResult with .intent (first) and .intents (all).
+        """
+        # 1. Try fast parser (only for simple, single-intent messages)
         fast_result = fast_parse(text)
         if fast_result and fast_result.confidence >= 0.75:
-            return AIResult(intent=fast_result, used_ai=False)
+            return AIResult(intents=[fast_result], used_ai=False)
 
-        # 2. Fallback to Gemini
+        # 2. Fallback to Gemini (handles multi-intent)
         try:
-            intent = await self._gemini_parse(text)
-            return AIResult(intent=intent, used_ai=True)
+            intents = await self._gemini_parse(text)
+            return AIResult(intents=intents, used_ai=True)
         except AIServiceError:
-            # If AI fails but we had a low-confidence fast result, use it
             if fast_result:
-                return AIResult(intent=fast_result, used_ai=False)
+                return AIResult(intents=[fast_result], used_ai=False)
             raise
 
-    async def _gemini_parse(self, text: str) -> ParsedIntent:
+    async def _gemini_parse(self, text: str) -> List[ParsedIntent]:
         async with self._sem:
             loop = asyncio.get_running_loop()
             try:
@@ -148,16 +188,15 @@ class AIService:
             prompt,
             generation_config={
                 "temperature": 0.1,
-                "max_output_tokens": 400,
+                "max_output_tokens": 1200,
                 "response_mime_type": "application/json",
             },
         )
         return (resp.text or "").strip()
 
-    def _parse_json_response(self, raw: str) -> ParsedIntent:
-        """Strip code fences, parse JSON, validate."""
+    def _parse_json_response(self, raw: str) -> List[ParsedIntent]:
+        """Parse JSON response. Handles both array and single object formats."""
         text = raw.strip()
-        # Remove markdown fences if present
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
@@ -165,24 +204,37 @@ class AIService:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
             logger.warning("JSON parse failed on: %s", raw[:200])
-            return ParsedIntent(type="UNKNOWN", confidence=0.0)
+            return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
-        return ParsedIntent(
-            type=str(data.get("type", "UNKNOWN")).upper(),
-            habit_name=data.get("habit_name"),
-            duration=data.get("duration"),
-            duration_unit=data.get("duration_unit"),
-            amount=data.get("amount"),
-            currency=(data.get("currency") or "UZS"),
-            category=data.get("category"),
-            date=data.get("date") or "today",
-            note=data.get("note"),
-            confidence=float(data.get("confidence") or 0.0),
-        )
+        # Normalize: always work with a list
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list) or not data:
+            return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
+
+        intents = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            intents.append(ParsedIntent(
+                type=str(item.get("type", "UNKNOWN")).upper(),
+                habit_name=item.get("habit_name"),
+                duration=item.get("duration"),
+                duration_unit=item.get("duration_unit"),
+                amount=item.get("amount"),
+                currency=(item.get("currency") or "UZS"),
+                category=item.get("category"),
+                date=item.get("date") or "today",
+                note=item.get("note"),
+                confidence=float(item.get("confidence") or 0.0),
+            ))
+
+        if not intents:
+            return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
+        return intents
 
     # ─── PREMIUM: AI insights ───────────────────────────────
     async def generate_insights(self, stats_summary: str) -> str:
-        """Generate personalized insights from stats (Premium feature)."""
         prompt = f"""Sen shaxsiy salomatlik va moliya maslahatchisisan. Quyidagi foydalanuvchi statistikasini tahlil qilib, o'zbek tilida 3-5 ta qisqa, amaliy va motivatsion maslahat ber. Har bir maslahat 1-2 gap bo'lsin. Markdown ishlat.
 
 Statistika:
