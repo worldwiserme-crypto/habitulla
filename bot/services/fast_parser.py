@@ -3,6 +3,9 @@
 Philosophy: ~70% of messages follow predictable patterns. Catching them
 locally saves ~1-2 seconds and ~$0.0001 per message vs. calling Gemini.
 
+NEW: If the message appears to contain MULTIPLE actions (e.g. "yugurdim. kitob
+o'qidim. dush qabul qildim"), we return None so AI can parse all items.
+
 Returns None if the message is ambiguous, letting AI handle it.
 """
 from __future__ import annotations
@@ -12,7 +15,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 # ─── Amount patterns ───────────────────────────────────────────────
-# "15000 som", "15 000 so'm", "15k", "1.5 mln", "2 ming"
 AMOUNT_RE = re.compile(
     r"(\d+(?:[\s.,]\d+)*)\s*(ming|mln|mlrd|million|milliard|k|m)?",
     re.IGNORECASE,
@@ -63,6 +65,15 @@ HABIT_KEYWORDS = {
     "velosiped": "Velosiped",
     "suzdim": "Suzish",
     "suzish": "Suzish",
+    "dush": "Dush qabul qilish",
+    "tish": "Tish yuvish",
+}
+
+# Verbs that indicate completed actions (helps count actions)
+ACTION_VERBS = {
+    "yugurdim", "yurdim", "o'qidim", "qildim", "qabul qildim", "ichdim",
+    "bajardim", "suzdim", "ishladim", "mashq qildim", "yozdim",
+    "eshitdim", "ko'rdim", "yedim", "tayyorladim",
 }
 
 CATEGORY_KEYWORDS = {
@@ -71,13 +82,13 @@ CATEGORY_KEYWORDS = {
                     "go'sht", "sabzavot", "meva", "choy", "kofe"],
     "transport": ["taksi", "yandex", "uber", "avtobus", "metro", "benzin", "yoqilg'i",
                    "marshrut", "poezd", "aeroport", "samolyot"],
-    "soglik": ["dori", "shifokor", "klinika", "doktor", "tish", "analiz", "dorixona",
+    "soglik": ["dori", "shifokor", "klinika", "doktor", "analiz", "dorixona",
                 "vitamin", "maslahat"],
     "kiyim": ["kiyim", "ko'ylak", "shim", "etik", "tuflik", "krossovka", "ko'ylakchi",
                "sumka", "paypoq"],
     "kommunal": ["svet", "elektr", "gaz", "suv", "internet", "telefon", "kommunal",
                   "arenda", "ijara", "wifi"],
-    "ta'lim": ["kurs", "dars", "kitob", "o'quv", "universitet", "maktab", "seminar",
+    "ta'lim": ["kurs", "o'quv", "universitet", "maktab", "seminar",
                 "webinar", "training"],
     "ko'ngil-ochar": ["kino", "teatr", "konsert", "o'yin", "gulzor", "park", "netflix",
                        "spotify", "youtube premium"],
@@ -110,15 +121,12 @@ def _parse_amount(text: str) -> tuple[Optional[float], Optional[str]]:
     """Extract amount + currency hint from text."""
     lower = text.lower()
 
-    # Detect currency
     currency = None
     for hint, code in CURRENCY_HINTS.items():
         if hint in lower:
             currency = code
             break
 
-    # Try patterns
-    # "1.5 mln" / "15 ming" / "15k"
     match = re.search(
         r"(\d+(?:[.,]\d+)?)\s*(ming|mln|mlrd|million|milliard|k|m|b)\b",
         lower,
@@ -133,8 +141,6 @@ def _parse_amount(text: str) -> tuple[Optional[float], Optional[str]]:
         }.get(unit, 1)
         return num * multiplier, currency
 
-    # Plain number with optional spaces/commas
-    # "15000", "15 000", "15,000"
     match = re.search(r"\b(\d{1,3}(?:[\s.,]\d{3})+|\d{4,})\b", text)
     if match:
         raw = match.group(1).replace(" ", "").replace(",", "").replace(".", "")
@@ -143,10 +149,8 @@ def _parse_amount(text: str) -> tuple[Optional[float], Optional[str]]:
         except ValueError:
             return None, currency
 
-    # Small number (rare for expenses but possible)
     match = re.search(r"\b(\d+(?:\.\d+)?)\b", text)
     if match and currency:
-        # Only trust if currency mentioned
         return float(match.group(1)), currency
 
     return None, currency
@@ -193,8 +197,61 @@ def _detect_date(text: str) -> str:
     return "today"
 
 
+def _is_complex_message(text: str) -> bool:
+    """Detect messages with MULTIPLE actions that need AI parsing.
+    
+    Heuristics:
+    - Contains periods/commas + multiple verbs
+    - Multiple duration markers
+    - Multiple amount markers
+    - Contains conjunctions like 'va', 'hamda', 'keyin'
+    """
+    lower = text.lower()
+    
+    # Count habit keywords present
+    habit_count = sum(1 for kw in HABIT_KEYWORDS.keys() if kw in lower)
+    
+    # Count action verbs
+    verb_count = sum(1 for v in ACTION_VERBS if v in lower)
+    
+    # Count sentence separators (period, semicolon, "va", "hamda", "keyin")
+    separator_count = (
+        text.count(".") + text.count(";") + text.count(",") +
+        len(re.findall(r"\b(va|hamda|keyin|so'ng|yana)\b", lower))
+    )
+    
+    # Count duration occurrences
+    duration_count = len(DURATION_RE.findall(lower))
+    
+    # Count amount occurrences
+    amount_count = len(re.findall(
+        r"\d+\s*(?:ming|mln|k|m|so'm|som|$|\d{3,})",
+        lower,
+    ))
+    
+    # Complex if:
+    # - 2+ habits mentioned
+    # - 2+ action verbs
+    # - 2+ durations
+    # - 2+ amounts
+    # - has separator AND (1+ habit or 1+ verb)
+    if habit_count >= 2 or verb_count >= 2:
+        return True
+    if duration_count >= 2 or amount_count >= 2:
+        return True
+    if separator_count >= 1 and (habit_count >= 1 or verb_count >= 1):
+        # Short single-clause like "Kitob 2 soat o'qidim." is NOT complex
+        # But "Yugurdim. Kitobni o'qidim" IS complex
+        # Heuristic: if original text has multiple clauses separated by period/semicolon
+        clauses = [c.strip() for c in re.split(r"[.;]", text) if c.strip()]
+        if len(clauses) >= 2:
+            return True
+    
+    return False
+
+
 def fast_parse(text: str) -> Optional[ParsedIntent]:
-    """Try to parse without AI. Returns None if confidence too low."""
+    """Try to parse without AI. Returns None if confidence too low OR message is complex."""
     if not text or len(text) < 2:
         return None
 
@@ -202,6 +259,10 @@ def fast_parse(text: str) -> Optional[ParsedIntent]:
 
     # Greeting / noise → let UNKNOWN handle
     if lower in {"salom", "hi", "hello", "assalomu alaykum", "/start", "/help"}:
+        return None
+
+    # NEW: Complex messages → defer to AI for multi-intent parsing
+    if _is_complex_message(text):
         return None
 
     amount, currency = _parse_amount(text)
