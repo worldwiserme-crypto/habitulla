@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: habit_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Tashkent
+    # For webhook mode only, uncomment:
+    # ports:
+    #   - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
