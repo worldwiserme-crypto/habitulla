@@ -1,6 +1,7 @@
-"""Gemini AI service: text parsing + voice transcription.
+"""Groq AI service: text parsing + voice transcription.
 
-UPDATED: Fallback to fast_parser when Gemini fails (quota, network, etc.)
+Uses Groq API (Llama 3.3 70B) instead of Gemini.
+Groq is free, fast, and works globally.
 """
 from __future__ import annotations
 
@@ -9,20 +10,22 @@ import json
 import os
 import re
 import tempfile
-import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import List, Optional
 
-import google.generativeai as genai
+from groq import Groq
 from pydub import AudioSegment
 
 from bot.config import config
 from bot.services.fast_parser import ParsedIntent, fast_parse
 from bot.utils.logger import logger
 
-genai.configure(api_key=config.gemini_api_key)
+# Groq client
+_groq_client = Groq(api_key=config.groq_api_key)
 
-MODEL_NAME = "gemini-2.5-flash-lite"
+# Model names
+TEXT_MODEL = "llama-3.3-70b-versatile"       # Fast, smart, free
+VOICE_MODEL = "whisper-large-v3-turbo"        # Voice → text
 
 PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assistantsan.
 
@@ -30,6 +33,7 @@ Foydalanuvchi BITTA xabarda BIR YOKI BIR NECHTA odat/xarajat/kirim yozishi mumki
 Matnni tahlil qilib HAR BIR harakatni alohida JSON obyekti sifatida qaytar.
 
 MUHIM: Natijani har DOIM JSON array (massiv) sifatida qaytar, hatto bitta narsa bo'lsa ham.
+Faqat JSON qaytar, boshqa hech narsa yozma (markdown, izoh, va h.k. yo'q).
 
 Har bir obyekt quyidagi formatda:
 {{
@@ -98,17 +102,17 @@ class AIServiceError(Exception):
 
 class AIService:
     def __init__(self) -> None:
-        self.model = genai.GenerativeModel(MODEL_NAME)
         self._sem = asyncio.Semaphore(10)
 
     # ─── VOICE ──────────────────────────────────────────────
     async def transcribe_voice(self, ogg_path: str) -> str:
+        """Convert voice message to text using Groq Whisper."""
         mp3_path = ogg_path.replace(".ogg", ".mp3")
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, self._convert_audio, ogg_path, mp3_path
             )
-            transcription = await self._gemini_audio(mp3_path)
+            transcription = await self._groq_transcribe(mp3_path)
             return transcription
         finally:
             for p in (ogg_path, mp3_path):
@@ -122,62 +126,49 @@ class AIService:
         audio = AudioSegment.from_file(src, format="ogg")
         audio.export(dst, format="mp3", bitrate="64k")
 
-    async def _gemini_audio(self, mp3_path: str) -> str:
+    async def _groq_transcribe(self, mp3_path: str) -> str:
         async with self._sem:
             try:
                 loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(
-                    None, self._sync_audio_call, mp3_path
+                    None, self._sync_transcribe_call, mp3_path
                 )
             except Exception as e:
                 logger.error("Voice transcription failed: %s", e)
                 raise AIServiceError("voice_transcription_failed") from e
 
-    def _sync_audio_call(self, mp3_path: str) -> str:
-        uploaded = genai.upload_file(mp3_path, mime_type="audio/mp3")
-        try:
-            resp = self.model.generate_content([
-                "Quyidagi ovozni o'zbek tilida matnga aylantir. FAQAT matnning o'zini qaytar, boshqa hech narsa yozma.",
-                uploaded,
-            ])
-            return (resp.text or "").strip()
-        finally:
-            try:
-                genai.delete_file(uploaded.name)
-            except Exception:
-                pass
+    def _sync_transcribe_call(self, mp3_path: str) -> str:
+        with open(mp3_path, "rb") as audio_file:
+            transcription = _groq_client.audio.transcriptions.create(
+                file=audio_file,
+                model=VOICE_MODEL,
+                language="uz",
+                response_format="text",
+            )
+        return str(transcription).strip()
 
     # ─── TEXT PARSING ───────────────────────────────────────
     async def parse_intent(self, text: str) -> AIResult:
-        """Parse user text into structured intent(s).
-        
-        Strategy:
-        1. Try fast_parser first (free, 100ms)
-        2. If confident (>=0.75), return it
-        3. Otherwise call Gemini AI
-        4. If Gemini fails (quota, network), fall back to fast_parser result
-        """
+        """Parse user text into structured intent(s)."""
         # 1. Try fast parser
         fast_result = fast_parse(text)
         if fast_result and fast_result.confidence >= 0.75:
             return AIResult(intents=[fast_result], used_ai=False)
 
-        # 2. Fallback to Gemini (handles multi-intent + unclear messages)
+        # 2. Fallback to Groq AI
         try:
-            intents = await self._gemini_parse(text)
+            intents = await self._groq_parse(text)
             return AIResult(intents=intents, used_ai=True)
         except AIServiceError as e:
-            # Gemini yiqildi — fast_parser bor bo'lsa ishlataman
-            logger.warning("Gemini unavailable, falling back. Reason: %s", e)
+            logger.warning("Groq unavailable, falling back. Reason: %s", e)
             if fast_result:
                 return AIResult(intents=[fast_result], used_ai=False)
-            # Hatto fast_parser ham yo'q — UNKNOWN qaytaramiz (xato ko'tarmaymiz!)
             return AIResult(
                 intents=[ParsedIntent(type="UNKNOWN", confidence=0.0)],
                 used_ai=False,
             )
 
-    async def _gemini_parse(self, text: str) -> List[ParsedIntent]:
+    async def _groq_parse(self, text: str) -> List[ParsedIntent]:
         async with self._sem:
             loop = asyncio.get_running_loop()
             try:
@@ -185,22 +176,27 @@ class AIService:
                     None, self._sync_text_call, text
                 )
             except Exception as e:
-                logger.error("Gemini parse failed: %s", e)
-                raise AIServiceError("gemini_parse_failed") from e
+                logger.error("Groq parse failed: %s", e)
+                raise AIServiceError("groq_parse_failed") from e
 
         return self._parse_json_response(raw)
 
     def _sync_text_call(self, text: str) -> str:
         prompt = PROMPT_TEMPLATE.format(user_message=text[:1500])
-        resp = self.model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.1,
-                "max_output_tokens": 1200,
-                "response_mime_type": "application/json",
-            },
+        response = _groq_client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Sen JSON array qaytaradigan assistantsan. Boshqa hech narsa yozma."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
         )
-        return (resp.text or "").strip()
+        return (response.choices[0].message.content or "").strip()
 
     def _parse_json_response(self, raw: str) -> List[ParsedIntent]:
         """Parse JSON response. Handles both array and single object formats."""
@@ -214,9 +210,17 @@ class AIService:
             logger.warning("JSON parse failed on: %s", raw[:200])
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
-        # Normalize: always work with a list
+        # Groq sometimes wraps array in object like {"intents": [...]} or {"result": [...]}
         if isinstance(data, dict):
-            data = [data]
+            # Check for common wrapping keys
+            for key in ("intents", "result", "data", "items", "actions"):
+                if key in data and isinstance(data[key], list):
+                    data = data[key]
+                    break
+            else:
+                # Single object — wrap in list
+                data = [data]
+
         if not isinstance(data, list) or not data:
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
@@ -260,15 +264,14 @@ FORMAT:
             try:
                 resp = await loop.run_in_executor(
                     None,
-                    lambda: self.model.generate_content(
-                        prompt,
-                        generation_config={
-                            "temperature": 0.7,
-                            "max_output_tokens": 600,
-                        },
+                    lambda: _groq_client.chat.completions.create(
+                        model=TEXT_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.7,
+                        max_tokens=600,
                     ),
                 )
-                return (resp.text or "").strip()
+                return (resp.choices[0].message.content or "").strip()
             except Exception as e:
                 logger.error("Insight generation failed: %s", e)
                 raise AIServiceError("insight_failed") from e
