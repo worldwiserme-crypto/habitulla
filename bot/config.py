@@ -49,7 +49,8 @@ class SubscriptionPlan:
 class Config:
     # Core
     bot_token: str = field(default_factory=lambda: _env("BOT_TOKEN", required=True))
-    gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY", required=True))
+    gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY", ""))
+    groq_api_key: str = field(default_factory=lambda: _env("GROQ_API_KEY", required=True))
     supabase_url: str = field(default_factory=lambda: _env("SUPABASE_URL", required=True))
     supabase_key: str = field(default_factory=lambda: _env("SUPABASE_KEY", required=True))
 
