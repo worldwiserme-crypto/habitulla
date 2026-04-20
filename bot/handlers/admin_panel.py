@@ -172,7 +172,7 @@ async def on_user_lookup_text(message: Message, state: FSMContext) -> None:
         f"🔗 Username: @{user.get('username') or '—'}\n"
         f"💱 Valyuta: {user.get('currency', 'UZS')}\n"
         f"🔔 Eslatmalar: {'✅' if user.get('reminders_on') else '❌'}\n"
-        f"🚫 Bloklangan: {'Ha' if user.get('is_banned') else 'Yo''q'}\n"
+        f"🚫 Bloklangan: {'Ha' if user.get('is_banned') else 'Yoq'}\n"
         f"📅 Ro'yxat: {str(user.get('created_at', ''))[:10]}\n"
         f"⏱ Oxirgi faollik: {str(user.get('last_active_at', ''))[:16].replace('T', ' ')}\n\n"
         f"💎 Obuna: <b>{sub.get('tier', 'free')}</b>\n"
