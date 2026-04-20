@@ -22,7 +22,7 @@ from bot.utils.logger import logger
 
 genai.configure(api_key=config.gemini_api_key)
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assistantsan.
 
