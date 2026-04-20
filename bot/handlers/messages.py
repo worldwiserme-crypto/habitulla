@@ -94,21 +94,6 @@ async def on_budget_mode(message: Message, state: FSMContext, user: dict) -> Non
         parse_mode="HTML",
     )
 
-
-@router.message(F.text == BTN_CABINET)
-async def on_cabinet(message: Message, state: FSMContext, user: dict) -> None:
-    await state.clear()
-    from bot.handlers.cabinet import show_cabinet
-    await show_cabinet(message, user)
-
-
-@router.message(F.text == BTN_REPORTS)
-async def on_reports_menu(message: Message, state: FSMContext, user: dict) -> None:
-    await state.clear()
-    from bot.handlers.reports import show_reports_menu
-    await show_reports_menu(message)
-
-
 # ═════════════════════ VOICE HANDLER ═════════════════════
 @router.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext, user: dict) -> None:
