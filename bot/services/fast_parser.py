@@ -3,10 +3,7 @@
 Philosophy: ~70% of messages follow predictable patterns. Catching them
 locally saves ~1-2 seconds and ~$0.0001 per message vs. calling Gemini.
 
-NEW: If the message appears to contain MULTIPLE actions (e.g. "yugurdim. kitob
-o'qidim. dush qabul qildim"), we return None so AI can parse all items.
-
-Returns None if the message is ambiguous, letting AI handle it.
+UPDATED: More conservative complex message detection to avoid quota burn.
 """
 from __future__ import annotations
 
@@ -39,7 +36,7 @@ EXPENSE_KEYWORDS = {
 }
 INCOME_KEYWORDS = {
     "oldim maosh", "maosh", "oylik", "bonus", "daromad", "kirim",
-    "topdim", "ishladim", "pul oldim",
+    "topdim", "pul oldim",
 }
 
 HABIT_KEYWORDS = {
@@ -69,11 +66,10 @@ HABIT_KEYWORDS = {
     "tish": "Tish yuvish",
 }
 
-# Verbs that indicate completed actions (helps count actions)
+# Faqat *noyob* harakat fe'llari (ular bir-biriga kirib ketmaydi)
 ACTION_VERBS = {
-    "yugurdim", "yurdim", "o'qidim", "qildim", "qabul qildim", "ichdim",
-    "bajardim", "suzdim", "ishladim", "mashq qildim", "yozdim",
-    "eshitdim", "ko'rdim", "yedim", "tayyorladim",
+    "yugurdim", "yurdim", "o'qidim", "suzdim", "bajardim",
+    "yozdim", "eshitdim", "ko'rdim", "yedim", "tayyorladim",
 }
 
 CATEGORY_KEYWORDS = {
@@ -200,52 +196,40 @@ def _detect_date(text: str) -> str:
 def _is_complex_message(text: str) -> bool:
     """Detect messages with MULTIPLE actions that need AI parsing.
     
-    Heuristics:
-    - Contains periods/commas + multiple verbs
-    - Multiple duration markers
-    - Multiple amount markers
-    - Contains conjunctions like 'va', 'hamda', 'keyin'
+    CONSERVATIVE approach — only flag as complex when we're CERTAIN.
+    Better to let fast_parser handle it than burn AI quota on simple messages.
     """
     lower = text.lower()
     
-    # Count habit keywords present
-    habit_count = sum(1 for kw in HABIT_KEYWORDS.keys() if kw in lower)
+    # 1. Split by strong separators (period, semicolon)
+    clauses = [c.strip() for c in re.split(r"[.;]", text) if c.strip()]
     
-    # Count action verbs
-    verb_count = sum(1 for v in ACTION_VERBS if v in lower)
-    
-    # Count sentence separators (period, semicolon, "va", "hamda", "keyin")
-    separator_count = (
-        text.count(".") + text.count(";") + text.count(",") +
-        len(re.findall(r"\b(va|hamda|keyin|so'ng|yana)\b", lower))
-    )
-    
-    # Count duration occurrences
-    duration_count = len(DURATION_RE.findall(lower))
-    
-    # Count amount occurrences
-    amount_count = len(re.findall(
-        r"\d+\s*(?:ming|mln|k|m|so'm|som|$|\d{3,})",
-        lower,
-    ))
-    
-    # Complex if:
-    # - 2+ habits mentioned
-    # - 2+ action verbs
-    # - 2+ durations
-    # - 2+ amounts
-    # - has separator AND (1+ habit or 1+ verb)
-    if habit_count >= 2 or verb_count >= 2:
-        return True
-    if duration_count >= 2 or amount_count >= 2:
-        return True
-    if separator_count >= 1 and (habit_count >= 1 or verb_count >= 1):
-        # Short single-clause like "Kitob 2 soat o'qidim." is NOT complex
-        # But "Yugurdim. Kitobni o'qidim" IS complex
-        # Heuristic: if original text has multiple clauses separated by period/semicolon
-        clauses = [c.strip() for c in re.split(r"[.;]", text) if c.strip()]
-        if len(clauses) >= 2:
+    # If 2+ separate sentences, check if each has meaningful content
+    if len(clauses) >= 2:
+        meaningful = 0
+        for clause in clauses:
+            cl = clause.lower()
+            has_habit = any(kw in cl for kw in HABIT_KEYWORDS.keys())
+            has_verb = any(v in cl for v in ACTION_VERBS)
+            has_amount = bool(re.search(r"\d+\s*(?:ming|mln|k|m|so'm|som)", cl))
+            has_duration = bool(DURATION_RE.search(cl))
+            if has_habit or has_verb or has_amount or has_duration:
+                meaningful += 1
+        if meaningful >= 2:
             return True
+    
+    # 2. Multiple amounts with currency markers
+    amount_matches = re.findall(
+        r"\d+\s*(?:ming|mln|mlrd|k\b|m\b)",
+        lower,
+    )
+    if len(amount_matches) >= 2:
+        return True
+    
+    # 3. Multiple durations (e.g., "30 daqiqa ... 1 soat ...")
+    duration_matches = DURATION_RE.findall(lower)
+    if len(duration_matches) >= 2:
+        return True
     
     return False
 
@@ -261,7 +245,7 @@ def fast_parse(text: str) -> Optional[ParsedIntent]:
     if lower in {"salom", "hi", "hello", "assalomu alaykum", "/start", "/help"}:
         return None
 
-    # NEW: Complex messages → defer to AI for multi-intent parsing
+    # Complex messages → defer to AI for multi-intent parsing
     if _is_complex_message(text):
         return None
 
@@ -319,7 +303,7 @@ def fast_parse(text: str) -> Optional[ParsedIntent]:
             category=category or "boshqa",
             date=date_val,
             note=text[:200],
-            confidence=0.6,  # Low — triggers AI fallback
+            confidence=0.6,  # Low — triggers AI fallback if available
         )
 
     return None
