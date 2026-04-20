@@ -1,6 +1,6 @@
 """Main message handler: text + voice parsing with context modes.
 
-UPDATED: Now processes MULTIPLE intents from a single message.
+UPDATED: Multi-intent parsing + Gemini fallback.
 
 Context modes (activated via main menu buttons):
   • habit_mode  — AI biased toward habit logs
@@ -94,6 +94,7 @@ async def on_budget_mode(message: Message, state: FSMContext, user: dict) -> Non
         parse_mode="HTML",
     )
 
+
 # ═════════════════════ VOICE HANDLER ═════════════════════
 @router.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext, user: dict) -> None:
@@ -166,6 +167,7 @@ async def handle_text(message: Message, state: FSMContext, user: dict) -> None:
     if not text:
         return
 
+    # Skip menu buttons — ular alohida handlerlar tomonidan qayta ishlanadi
     if text in {BTN_HABIT, BTN_BUDGET, BTN_CABINET, BTN_REPORTS}:
         return
 
@@ -185,12 +187,13 @@ async def _process_intents(
     """Parse text, save ALL detected intents (multi-intent support)."""
     user_id = user["id"]
     user_currency = user.get("currency") or "UZS"
-    mode = await state.get_state()
 
     try:
         result = await ai.parse_intent(text)
     except AIServiceError:
-        await message.answer("⚠️ AI xizmatida muammo. Qayta urinib ko'ring.")
+        await message.answer(
+            "⚠️ AI xizmatida vaqtincha muammo. Bir ozdan keyin urinib ko'ring."
+        )
         return
     except Exception as e:
         logger.error("Intent parse failed: %s", e, exc_info=True)
@@ -304,7 +307,16 @@ async def _send_summary(
         )
         return
 
-    lines = []
+    # Check streak once (works for any habit save)
+    streak_line = ""
+    if habits:
+        from bot.services.analytics_service import compute_streak
+        try:
+            streak = await compute_streak(user_id)
+            if streak > 0 and streak % 7 == 0:
+                streak_line = f"\n\n🔥 <b>{streak} kun streak!</b> Ajoyib!"
+        except Exception:
+            pass
 
     # Single-item: keep it concise
     if total == 1 and not errors:
@@ -317,21 +329,11 @@ async def _send_summary(
         else:
             msg = "✅ Saqlandi!"
 
-        # Show streak milestone
-        if habits:
-            from bot.services.analytics_service import compute_streak
-            try:
-                streak = await compute_streak(user_id)
-                if streak > 0 and streak % 7 == 0:
-                    msg += f"\n\n🔥 <b>{streak} kun streak!</b> Ajoyib!"
-            except Exception:
-                pass
-
-        await message.answer(msg, parse_mode="HTML")
+        await message.answer(msg + streak_line, parse_mode="HTML")
         return
 
     # Multi-item summary
-    lines.append(f"✅ <b>{total} ta yozuv saqlandi:</b>\n")
+    lines = [f"✅ <b>{total} ta yozuv saqlandi:</b>\n"]
 
     if habits:
         lines.append("🎯 <b>Odatlar:</b>")
@@ -354,7 +356,8 @@ async def _send_summary(
     if errors:
         lines.append(f"⚠️ <i>{len(errors)} ta yozuvda xatolik.</i>")
 
-    await message.answer("\n".join(lines).strip(), parse_mode="HTML")
+    final = "\n".join(lines).strip() + streak_line
+    await message.answer(final, parse_mode="HTML")
 
 
 async def _send_limit_reached(message: Message, count: int, limit: int) -> None:
