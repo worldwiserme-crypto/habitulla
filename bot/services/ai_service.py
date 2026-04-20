@@ -1,8 +1,6 @@
 """Gemini AI service: text parsing + voice transcription.
 
-UPDATED: Now supports parsing MULTIPLE intents from a single message.
-E.g. "Yugurdim 30 min. Kitob 1 soat o'qidim. Dush qabul qildim."
-    → returns 3 separate intents
+UPDATED: Fallback to fast_parser when Gemini fails (quota, network, etc.)
 """
 from __future__ import annotations
 
@@ -153,21 +151,31 @@ class AIService:
     async def parse_intent(self, text: str) -> AIResult:
         """Parse user text into structured intent(s).
         
-        For backward compatibility, returns AIResult with .intent (first) and .intents (all).
+        Strategy:
+        1. Try fast_parser first (free, 100ms)
+        2. If confident (>=0.75), return it
+        3. Otherwise call Gemini AI
+        4. If Gemini fails (quota, network), fall back to fast_parser result
         """
-        # 1. Try fast parser (only for simple, single-intent messages)
+        # 1. Try fast parser
         fast_result = fast_parse(text)
         if fast_result and fast_result.confidence >= 0.75:
             return AIResult(intents=[fast_result], used_ai=False)
 
-        # 2. Fallback to Gemini (handles multi-intent)
+        # 2. Fallback to Gemini (handles multi-intent + unclear messages)
         try:
             intents = await self._gemini_parse(text)
             return AIResult(intents=intents, used_ai=True)
-        except AIServiceError:
+        except AIServiceError as e:
+            # Gemini yiqildi — fast_parser bor bo'lsa ishlataman
+            logger.warning("Gemini unavailable, falling back. Reason: %s", e)
             if fast_result:
                 return AIResult(intents=[fast_result], used_ai=False)
-            raise
+            # Hatto fast_parser ham yo'q — UNKNOWN qaytaramiz (xato ko'tarmaymiz!)
+            return AIResult(
+                intents=[ParsedIntent(type="UNKNOWN", confidence=0.0)],
+                used_ai=False,
+            )
 
     async def _gemini_parse(self, text: str) -> List[ParsedIntent]:
         async with self._sem:
@@ -177,7 +185,7 @@ class AIService:
                     None, self._sync_text_call, text
                 )
             except Exception as e:
-                logger.error("Gemini parse failed: %s\n%s", e, traceback.format_exc())
+                logger.error("Gemini parse failed: %s", e)
                 raise AIServiceError("gemini_parse_failed") from e
 
         return self._parse_json_response(raw)
