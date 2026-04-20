@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from bot.config import config
+from bot.keyboards.common import BTN_REPORTS
 from bot.keyboards.reports import report_format_keyboard, report_period_keyboard
 from bot.services.db_service import db
 from bot.services.excel_service import cleanup_file, generate_excel_report
@@ -24,6 +25,7 @@ router = Router(name="reports")
 
 
 @router.message(Command("report"))
+@router.message(F.text == BTN_REPORTS)
 async def cmd_report(message: Message) -> None:
     await message.answer(
         "📈 <b>Hisobot davrini tanlang:</b>",
@@ -103,6 +105,11 @@ async def on_report_format(callback: CallbackQuery, user: dict) -> None:
         return
 
     _, period_code, fmt = parts[0], parts[1], parts[2]
+
+    # Custom date range uses different handler below
+    if period_code.startswith("custom_"):
+        return
+
     start, end = _resolve_period(period_code)
     user_id = user["id"]
     currency = user.get("currency") or "UZS"
@@ -178,9 +185,11 @@ async def on_custom_date_range(message: Message, user: dict) -> None:
         )
         return
 
-    await message.answer(f"📅 <b>Davr:</b> {format_date(start)} — {format_date(end)}\n\nFormat tanlang:",
-                         parse_mode="HTML",
-                         reply_markup=report_format_keyboard(f"custom_{start.isoformat()}_{end.isoformat()}"))
+    await message.answer(
+        f"📅 <b>Davr:</b> {format_date(start)} — {format_date(end)}\n\nFormat tanlang:",
+        parse_mode="HTML",
+        reply_markup=report_format_keyboard(f"custom_{start.isoformat()}_{end.isoformat()}"),
+    )
 
 
 @router.callback_query(F.data.startswith("format:custom_"))
