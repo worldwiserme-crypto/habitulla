@@ -23,8 +23,8 @@ from bot.utils.logger import logger
 _groq_client = Groq(api_key=config.groq_api_key)
 
 # Models
-TEXT_MODEL = "llama-3.3-70b-versatile"       # Fast, smart, free
-VOICE_MODEL = "whisper-large-v3"              # Full model (best for Uzbek)
+TEXT_MODEL = "llama-3.3-70b-versatile"
+VOICE_MODEL = "whisper-large-v3"
 
 # Prompt to help Whisper understand Uzbek context
 VOICE_PROMPT = (
@@ -113,9 +113,9 @@ class AIService:
     def __init__(self) -> None:
         self._sem = asyncio.Semaphore(10)
 
-    # ─── VOICE (Whisper Large v3) ──────────────────────────
+    # ═══════════════════ VOICE ═══════════════════
     async def transcribe_voice(self, ogg_path: str) -> str:
-        """Convert voice → text using Whisper Large v3 with Uzbek context."""
+        """Convert voice to text using Whisper Large v3."""
         mp3_path = ogg_path.replace(".ogg", ".mp3")
         try:
             await asyncio.get_running_loop().run_in_executor(
@@ -135,7 +135,6 @@ class AIService:
     def _convert_audio(self, src: str, dst: str) -> None:
         """Convert OGG to MP3. Pad to 30s if shorter (Whisper requirement)."""
         audio = AudioSegment.from_file(src, format="ogg")
-        # Whisper works best with audio >= 30 seconds
         if len(audio) < 30000:
             silence = AudioSegment.silent(duration=30000 - len(audio))
             audio = audio + silence
@@ -164,10 +163,10 @@ class AIService:
             )
         return str(transcription).strip()
 
-    # ─── TEXT PARSING ──────────────────────────────────────
+    # ═══════════════════ TEXT PARSING ═══════════════════
     async def parse_intent(self, text: str) -> AIResult:
         """Parse user text into structured intent(s)."""
-        # 1. Try fast parser first
+        # 1. Try fast parser
         fast_result = fast_parse(text)
         if fast_result and fast_result.confidence >= 0.75:
             return AIResult(intents=[fast_result], used_ai=False)
@@ -216,7 +215,7 @@ class AIService:
         return (response.choices[0].message.content or "").strip()
 
     def _parse_json_response(self, raw: str) -> List[ParsedIntent]:
-        """Parse JSON response. Handles array, single object, and wrapped formats."""
+        """Parse JSON response."""
         text = raw.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -227,14 +226,13 @@ class AIService:
             logger.warning("JSON parse failed on: %s", raw[:200])
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
-        # Groq sometimes wraps in {"intents": [...]} or {"result": [...]}
+        # Unwrap if response is {"intents": [...]} or similar
         if isinstance(data, dict):
             for key in ("intents", "result", "data", "items", "actions", "response"):
                 if key in data and isinstance(data[key], list):
                     data = data[key]
                     break
             else:
-                # Single object — wrap in list if it has a type field
                 if "type" in data:
                     data = [data]
                 else:
@@ -268,9 +266,23 @@ class AIService:
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
         return intents
 
-    # ─── PREMIUM: AI insights ──────────────────────────────
+    # ═══════════════════ PREMIUM: AI INSIGHTS ═══════════════════
     async def generate_insights(self, stats_summary: str) -> str:
-        prompt = f"""Sen shaxsiy salomatlik va moliya maslahatchisisan. Quyidagi foydalanuvchi statistikasini tahlil qilib, o'zbek tilida 3-5 ta qisqa, amaliy va motivatsion maslahat ber. Har bir maslahat 1-2 gap bo'lsin. Markdown ishlat.
+        """Generate personalized insights using Groq."""
+        prompt = self._build_insights_prompt(stats_summary)
+        async with self._sem:
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, self._sync_insights_call, prompt
+                )
+                return result
+            except Exception as e:
+                logger.error("Insight generation failed: %s", e)
+                raise AIServiceError("insight_failed") from e
+
+    def _build_insights_prompt(self, stats_summary: str) -> str:
+        return f"""Sen shaxsiy salomatlik va moliya maslahatchisisan. Quyidagi foydalanuvchi statistikasini tahlil qilib, o'zbek tilida 3-5 ta qisqa, amaliy va motivatsion maslahat ber. Har bir maslahat 1-2 gap bo'lsin. Markdown ishlat.
 
 Statistika:
 {stats_summary}
@@ -280,11 +292,16 @@ FORMAT:
 
 1. [maslahat]
 2. [maslahat]
-...
 """
-        async with self._sem:
-            loop = asyncio.get_running_loop()
-            try:
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: _groq_client.chat.completions.create(
+
+    def _sync_insights_call(self, prompt: str) -> str:
+        response = _groq_client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=600,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+
+ai = AIService()
