@@ -1,7 +1,7 @@
 """Groq AI service: text parsing + voice transcription.
 
-Uses Groq API (Llama 3.3 70B) instead of Gemini.
-Groq is free, fast, and works globally.
+Uses Groq API (Llama 3.3 70B) for text and Whisper Large v3 for voice.
+Whisper Large v3 provides best multilingual support including Uzbek.
 """
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import asyncio
 import json
 import os
 import re
-import tempfile
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -23,9 +22,17 @@ from bot.utils.logger import logger
 # Groq client
 _groq_client = Groq(api_key=config.groq_api_key)
 
-# Model names
+# Models
 TEXT_MODEL = "llama-3.3-70b-versatile"       # Fast, smart, free
-VOICE_MODEL = "whisper-large-v3-turbo"        # Voice → text
+VOICE_MODEL = "whisper-large-v3"              # Full model (best for Uzbek)
+
+# Prompt to help Whisper understand Uzbek context
+VOICE_PROMPT = (
+    "Bu o'zbek tilidagi ovoz yozuvi. "
+    "Foydalanuvchi odat yoki xarajat haqida gapiryapti. "
+    "Masalan: yugurdim, kitob o'qidim, non oldim, taksiga to'ladim, "
+    "ming so'm, mln so'm, daqiqa, soat, kilometr."
+)
 
 PROMPT_TEMPLATE = """Sen o'zbek tilida yozilgan matndan ma'lumot ajratuvchi assistantsan.
 
@@ -33,7 +40,7 @@ Foydalanuvchi BITTA xabarda BIR YOKI BIR NECHTA odat/xarajat/kirim yozishi mumki
 Matnni tahlil qilib HAR BIR harakatni alohida JSON obyekti sifatida qaytar.
 
 MUHIM: Natijani har DOIM JSON array (massiv) sifatida qaytar, hatto bitta narsa bo'lsa ham.
-Faqat JSON qaytar, boshqa hech narsa yozma (markdown, izoh, va h.k. yo'q).
+Faqat JSON qaytar, boshqa hech narsa yozma.
 
 Har bir obyekt quyidagi formatda:
 {{
@@ -59,6 +66,9 @@ Javob: [{{"type": "BUDGET_EXPENSE", "category": "oziq-ovqat", "amount": 15000, "
 
 Matn: "taksiga 25 ming to'ladim"
 Javob: [{{"type": "BUDGET_EXPENSE", "category": "transport", "amount": 25000, "currency": "UZS", "date": "today", "confidence": 0.95}}]
+
+Matn: "maosh 3 mln so'm"
+Javob: [{{"type": "BUDGET_INCOME", "amount": 3000000, "currency": "UZS", "date": "today", "note": "maosh", "confidence": 0.95}}]
 
 Matn: "BUGUN 4 SOAT YUGURDIM. 10 DAQIQA KITOB O'QIDIM. Dush qabul qildim"
 Javob: [
@@ -90,7 +100,6 @@ class AIResult:
 
     @property
     def intent(self) -> ParsedIntent:
-        """Backward compatibility: return first intent."""
         if self.intents:
             return self.intents[0]
         return ParsedIntent(type="UNKNOWN", confidence=0.0)
@@ -104,15 +113,16 @@ class AIService:
     def __init__(self) -> None:
         self._sem = asyncio.Semaphore(10)
 
-    # ─── VOICE ──────────────────────────────────────────────
+    # ─── VOICE (Whisper Large v3) ──────────────────────────
     async def transcribe_voice(self, ogg_path: str) -> str:
-        """Convert voice message to text using Groq Whisper."""
+        """Convert voice → text using Whisper Large v3 with Uzbek context."""
         mp3_path = ogg_path.replace(".ogg", ".mp3")
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, self._convert_audio, ogg_path, mp3_path
             )
             transcription = await self._groq_transcribe(mp3_path)
+            logger.info("Voice transcription: %s", transcription[:200])
             return transcription
         finally:
             for p in (ogg_path, mp3_path):
@@ -123,7 +133,12 @@ class AIService:
                     pass
 
     def _convert_audio(self, src: str, dst: str) -> None:
+        """Convert OGG to MP3. Pad to 30s if shorter (Whisper requirement)."""
         audio = AudioSegment.from_file(src, format="ogg")
+        # Whisper works best with audio >= 30 seconds
+        if len(audio) < 30000:
+            silence = AudioSegment.silent(duration=30000 - len(audio))
+            audio = audio + silence
         audio.export(dst, format="mp3", bitrate="64k")
 
     async def _groq_transcribe(self, mp3_path: str) -> str:
@@ -140,17 +155,19 @@ class AIService:
     def _sync_transcribe_call(self, mp3_path: str) -> str:
         with open(mp3_path, "rb") as audio_file:
             transcription = _groq_client.audio.transcriptions.create(
-                file=audio_file,
+                file=(os.path.basename(mp3_path), audio_file.read()),
                 model=VOICE_MODEL,
                 language="uz",
+                prompt=VOICE_PROMPT,
                 response_format="text",
+                temperature=0.0,
             )
         return str(transcription).strip()
 
-    # ─── TEXT PARSING ───────────────────────────────────────
+    # ─── TEXT PARSING ──────────────────────────────────────
     async def parse_intent(self, text: str) -> AIResult:
         """Parse user text into structured intent(s)."""
-        # 1. Try fast parser
+        # 1. Try fast parser first
         fast_result = fast_parse(text)
         if fast_result and fast_result.confidence >= 0.75:
             return AIResult(intents=[fast_result], used_ai=False)
@@ -199,7 +216,7 @@ class AIService:
         return (response.choices[0].message.content or "").strip()
 
     def _parse_json_response(self, raw: str) -> List[ParsedIntent]:
-        """Parse JSON response. Handles both array and single object formats."""
+        """Parse JSON response. Handles array, single object, and wrapped formats."""
         text = raw.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -210,16 +227,18 @@ class AIService:
             logger.warning("JSON parse failed on: %s", raw[:200])
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
-        # Groq sometimes wraps array in object like {"intents": [...]} or {"result": [...]}
+        # Groq sometimes wraps in {"intents": [...]} or {"result": [...]}
         if isinstance(data, dict):
-            # Check for common wrapping keys
-            for key in ("intents", "result", "data", "items", "actions"):
+            for key in ("intents", "result", "data", "items", "actions", "response"):
                 if key in data and isinstance(data[key], list):
                     data = data[key]
                     break
             else:
-                # Single object — wrap in list
-                data = [data]
+                # Single object — wrap in list if it has a type field
+                if "type" in data:
+                    data = [data]
+                else:
+                    return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
 
         if not isinstance(data, list) or not data:
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
@@ -228,24 +247,28 @@ class AIService:
         for item in data:
             if not isinstance(item, dict):
                 continue
-            intents.append(ParsedIntent(
-                type=str(item.get("type", "UNKNOWN")).upper(),
-                habit_name=item.get("habit_name"),
-                duration=item.get("duration"),
-                duration_unit=item.get("duration_unit"),
-                amount=item.get("amount"),
-                currency=(item.get("currency") or "UZS"),
-                category=item.get("category"),
-                date=item.get("date") or "today",
-                note=item.get("note"),
-                confidence=float(item.get("confidence") or 0.0),
-            ))
+            try:
+                intents.append(ParsedIntent(
+                    type=str(item.get("type", "UNKNOWN")).upper(),
+                    habit_name=item.get("habit_name"),
+                    duration=item.get("duration"),
+                    duration_unit=item.get("duration_unit"),
+                    amount=item.get("amount"),
+                    currency=(item.get("currency") or "UZS"),
+                    category=item.get("category"),
+                    date=item.get("date") or "today",
+                    note=item.get("note"),
+                    confidence=float(item.get("confidence") or 0.0),
+                ))
+            except (TypeError, ValueError) as e:
+                logger.warning("Failed to parse intent item: %s", e)
+                continue
 
         if not intents:
             return [ParsedIntent(type="UNKNOWN", confidence=0.0)]
         return intents
 
-    # ─── PREMIUM: AI insights ───────────────────────────────
+    # ─── PREMIUM: AI insights ──────────────────────────────
     async def generate_insights(self, stats_summary: str) -> str:
         prompt = f"""Sen shaxsiy salomatlik va moliya maslahatchisisan. Quyidagi foydalanuvchi statistikasini tahlil qilib, o'zbek tilida 3-5 ta qisqa, amaliy va motivatsion maslahat ber. Har bir maslahat 1-2 gap bo'lsin. Markdown ishlat.
 
@@ -265,16 +288,3 @@ FORMAT:
                 resp = await loop.run_in_executor(
                     None,
                     lambda: _groq_client.chat.completions.create(
-                        model=TEXT_MODEL,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.7,
-                        max_tokens=600,
-                    ),
-                )
-                return (resp.choices[0].message.content or "").strip()
-            except Exception as e:
-                logger.error("Insight generation failed: %s", e)
-                raise AIServiceError("insight_failed") from e
-
-
-ai = AIService()
